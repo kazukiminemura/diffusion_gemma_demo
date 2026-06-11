@@ -1,52 +1,38 @@
 from __future__ import annotations
 
 import argparse
-import shutil
-import subprocess
+import re
 import sys
 from dataclasses import dataclass
-from pathlib import Path
+from typing import Iterable
 
 
-DEFAULT_REPO_ID = "unsloth/diffusiongemma-26B-A4B-it-GGUF"
-DEFAULT_QUANT = "Q4_K_M"
-DEFAULT_LOCAL_DIR = "models/unsloth/diffusiongemma-26B-A4B-it-GGUF"
-DEFAULT_LLAMA_BINARY = "llama-diffusion-cli"
+DEFAULT_MODEL_ID = "google/diffusiongemma-26B-A4B-it"
 THINK_TOKEN = "<|think|>"
 
 
 @dataclass(frozen=True)
-class GgufOptions:
-    repo_id: str
-    quant: str
-    model_path: Path | None
-    local_dir: Path
-    llama_binary: str
-    gpu_layers: int
+class GenerationOptions:
     max_new_tokens: int
     stream: bool
     raw: bool
-    no_download: bool
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="diffusion-gemma",
-        description="Run the quantized Unsloth DiffusionGemma GGUF with llama-diffusion-cli.",
+        description="Run google/diffusiongemma-26B-A4B-it with Hugging Face Transformers.",
     )
     parser.add_argument("prompt", nargs="*", help="Prompt text. Omit for interactive chat mode.")
-    parser.add_argument("--repo-id", default=DEFAULT_REPO_ID, help=f"Hugging Face GGUF repo. Default: {DEFAULT_REPO_ID}")
-    parser.add_argument("--quant", default=DEFAULT_QUANT, help=f"GGUF quantization to download. Default: {DEFAULT_QUANT}")
-    parser.add_argument("--model-path", type=Path, help="Path to an existing .gguf file. Skips Hugging Face download.")
-    parser.add_argument("--local-dir", type=Path, default=Path(DEFAULT_LOCAL_DIR), help=f"Download directory. Default: {DEFAULT_LOCAL_DIR}")
-    parser.add_argument("--llama-binary", default=DEFAULT_LLAMA_BINARY, help=f"Path/name of llama-diffusion-cli. Default: {DEFAULT_LLAMA_BINARY}")
-    parser.add_argument("--gpu-layers", type=int, default=99, help="Layers to offload to GPU via -ngl. Use 0 for CPU-only. Default: 99")
+    parser.add_argument("--model-id", default=DEFAULT_MODEL_ID, help=f"Model ID to load. Default: {DEFAULT_MODEL_ID}")
     parser.add_argument("--system", default="", help="Optional system prompt.")
     parser.add_argument("--think", action="store_true", help=f"Enable thinking mode by prefixing the system prompt with {THINK_TOKEN}.")
-    parser.add_argument("--max-new-tokens", type=positive_int, default=512, help="Target generated tokens passed as -n. Default: 512")
-    parser.add_argument("--stream", action="store_true", help="Show the live diffusion canvas with --diffusion-visual.")
-    parser.add_argument("--raw", action="store_true", help="Do not post-process llama.cpp output.")
-    parser.add_argument("--no-download", action="store_true", help="Require --model-path or an already downloaded matching GGUF.")
+    parser.add_argument("--max-new-tokens", type=positive_int, default=512, help="Maximum tokens to generate. Default: 512")
+    parser.add_argument("--dtype", default="auto", help='dtype passed to from_pretrained. Default: "auto"')
+    parser.add_argument("--device-map", default="auto", help='device_map passed to from_pretrained. Default: "auto"')
+    parser.add_argument("--stream", action="store_true", help="Show diffusion intermediate text while generating.")
+    parser.add_argument("--raw", action="store_true", help="Print the raw decoded sequence, including chat tags and special tokens.")
+    parser.add_argument("--no-gpu-check", action="store_true", help="Skip the CUDA availability warning.")
     return parser
 
 
@@ -59,122 +45,105 @@ def positive_int(value: str) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    options = GgufOptions(
-        repo_id=args.repo_id,
-        quant=args.quant,
-        model_path=args.model_path,
-        local_dir=args.local_dir,
-        llama_binary=args.llama_binary,
-        gpu_layers=args.gpu_layers,
+
+    try:
+        runner = DiffusionGemmaRunner(
+            model_id=args.model_id,
+            dtype=args.dtype,
+            device_map=args.device_map,
+            check_gpu=not args.no_gpu_check,
+        )
+    except Exception as exc:  # pragma: no cover - depends on local GPU/model availability
+        print(f"Failed to load model: {exc}", file=sys.stderr)
+        return 1
+
+    options = GenerationOptions(
         max_new_tokens=args.max_new_tokens,
         stream=args.stream,
         raw=args.raw,
-        no_download=args.no_download,
     )
-
-    try:
-        runner = DiffusionGemmaGgufRunner(options)
-    except RuntimeError as exc:
-        print(f"Setup failed: {exc}", file=sys.stderr)
-        return 1
-
     system_prompt = make_system_prompt(args.system, args.think)
+
     if args.prompt:
-        prompt = build_prompt(" ".join(args.prompt), system_prompt)
-        return runner.run_once(prompt)
+        prompt = " ".join(args.prompt)
+        response = runner.generate(
+            messages=make_messages(prompt, system_prompt=system_prompt),
+            options=options,
+        )
+        print(response)
+        return 0
 
-    return runner.run_chat()
-
-
-class DiffusionGemmaGgufRunner:
-    def __init__(self, options: GgufOptions) -> None:
-        self.options = options
-        self.binary = resolve_binary(options.llama_binary)
-        self.model_path = resolve_model_path(options)
-
-    def run_once(self, prompt: str) -> int:
-        command = self.base_command()
-        command.extend(["-p", prompt])
-        return run_command(command, raw=self.options.raw)
-
-    def run_chat(self) -> int:
-        command = self.base_command()
-        command.append("-cnv")
-        return run_command(command, raw=True)
-
-    def base_command(self) -> list[str]:
-        command = [
-            str(self.binary),
-            "-m",
-            str(self.model_path),
-            "-ngl",
-            str(self.options.gpu_layers),
-            "-n",
-            str(self.options.max_new_tokens),
-        ]
-        if self.options.stream:
-            command.append("--diffusion-visual")
-        return command
+    return run_repl(runner, options=options, system_prompt=system_prompt)
 
 
-def resolve_binary(binary: str) -> Path:
-    binary_path = Path(binary)
-    if binary_path.exists():
-        return binary_path
+class DiffusionGemmaRunner:
+    def __init__(self, model_id: str, dtype: str, device_map: str, check_gpu: bool) -> None:
+        self._warn_about_gpu(check_gpu)
 
-    found = shutil.which(binary)
-    if found:
-        return Path(found)
+        try:
+            import torch
+            from transformers import AutoProcessor, DiffusionGemmaForBlockDiffusion
+        except ImportError as exc:
+            raise RuntimeError("Install dependencies with `pip install -e .` before running the CLI.") from exc
 
-    raise RuntimeError(
-        "llama-diffusion-cli was not found. Build the DiffusionGemma llama.cpp branch "
-        "and pass its path with --llama-binary."
-    )
+        self.torch = torch
+        self.processor = AutoProcessor.from_pretrained(model_id)
+        self.model = DiffusionGemmaForBlockDiffusion.from_pretrained(
+            model_id,
+            dtype=dtype,
+            device_map=device_map,
+        )
+        self.model.eval()
 
+    def generate(self, messages: list[dict[str, str]], options: GenerationOptions) -> str:
+        inputs = self.processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+        ).to(self.model.device)
 
-def resolve_model_path(options: GgufOptions) -> Path:
-    if options.model_path:
-        path = options.model_path.expanduser().resolve()
-        if not path.exists():
-            raise RuntimeError(f"GGUF file does not exist: {path}")
-        return path
+        generate_kwargs = {
+            **inputs,
+            "max_new_tokens": options.max_new_tokens,
+        }
 
-    existing = sorted(options.local_dir.glob(f"*{options.quant}*.gguf"))
-    if existing:
-        return existing[0].resolve()
+        if options.stream:
+            from transformers import TextDiffusionStreamer
 
-    if options.no_download:
-        raise RuntimeError(f"No *{options.quant}*.gguf found in {options.local_dir}.")
+            generate_kwargs["streamer"] = TextDiffusionStreamer(tokenizer=self.processor.tokenizer)
 
-    return download_gguf(options.repo_id, options.quant, options.local_dir)
+        with self.torch.inference_mode():
+            output = self.model.generate(**generate_kwargs)
 
+        decoded = self.processor.decode(output[0], skip_special_tokens=False)
+        if options.raw:
+            return decoded
 
-def download_gguf(repo_id: str, quant: str, local_dir: Path) -> Path:
-    try:
-        from huggingface_hub import snapshot_download
-    except ImportError as exc:
-        raise RuntimeError("Install dependencies with `pip install -e .` to enable GGUF downloads.") from exc
+        return extract_final_answer(decoded)
 
-    local_dir.mkdir(parents=True, exist_ok=True)
-    snapshot_download(
-        repo_id=repo_id,
-        local_dir=local_dir,
-        allow_patterns=[f"*{quant}*.gguf"],
-    )
+    def _warn_about_gpu(self, check_gpu: bool) -> None:
+        if not check_gpu:
+            return
+        try:
+            import torch
+        except ImportError:
+            return
 
-    matches = sorted(local_dir.glob(f"*{quant}*.gguf"))
-    if not matches:
-        raise RuntimeError(f"Downloaded repo did not contain a *{quant}*.gguf file.")
-    return matches[0].resolve()
+        if not torch.cuda.is_available():
+            print(
+                "Warning: CUDA is not available. DiffusionGemma 26B usually requires a large GPU; loading may fail or be very slow.",
+                file=sys.stderr,
+            )
+            return
 
-
-def run_command(command: list[str], raw: bool) -> int:
-    if raw:
-        return subprocess.run(command, check=False).returncode
-
-    completed = subprocess.run(command, check=False, text=True, stdout=subprocess.PIPE, stderr=None)
-    print(clean_llama_output(completed.stdout))
-    return completed.returncode
+        memory_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        if memory_gb < 60:
+            print(
+                f"Warning: detected CUDA device has {memory_gb:.1f}GB VRAM. Google recommends a GPU with more than 60GB for this model.",
+                file=sys.stderr,
+            )
 
 
 def make_system_prompt(system_prompt: str, think: bool) -> str:
@@ -184,19 +153,77 @@ def make_system_prompt(system_prompt: str, think: bool) -> str:
     return system_prompt
 
 
-def build_prompt(user_prompt: str, system_prompt: str) -> str:
-    if not system_prompt:
-        return user_prompt
-    return f"System:\n{system_prompt}\n\nUser:\n{user_prompt}\n\nAssistant:\n"
+def make_messages(prompt: str, system_prompt: str = "", history: Iterable[dict[str, str]] = ()) -> list[dict[str, str]]:
+    messages: list[dict[str, str]] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.extend(history)
+    messages.append({"role": "user", "content": prompt})
+    return messages
 
 
-def clean_llama_output(output: str) -> str:
-    lines = []
-    for line in output.splitlines():
-        if line.startswith("llama_") or line.startswith("ggml_") or line.startswith("build:"):
+def run_repl(runner: DiffusionGemmaRunner, options: GenerationOptions, system_prompt: str) -> int:
+    print("DiffusionGemma chat. Type /exit or press Ctrl+C to quit.")
+    history: list[dict[str, str]] = []
+
+    while True:
+        try:
+            prompt = input("\nuser> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+
+        if not prompt:
             continue
-        lines.append(line)
-    return "\n".join(lines).strip()
+        if prompt in {"/exit", "/quit"}:
+            return 0
+
+        response = runner.generate(
+            messages=make_messages(prompt, system_prompt=system_prompt, history=history),
+            options=options,
+        )
+        print(f"\nmodel> {response}")
+
+        history.append({"role": "user", "content": prompt})
+        history.append({"role": "assistant", "content": response})
+
+
+def extract_final_answer(decoded: str) -> str:
+    text = strip_after_first(decoded, "<turn|>")
+    text = remove_prompt_turns(text)
+    text = remove_thought_channel(text)
+    text = remove_special_tokens(text)
+    return collapse_padding(text).strip()
+
+
+def strip_after_first(text: str, marker: str) -> str:
+    if marker in text:
+        return text.rsplit(marker, maxsplit=1)[0]
+    return text
+
+
+def remove_prompt_turns(text: str) -> str:
+    model_marker = "<|turn>model"
+    if model_marker in text:
+        return text.split(model_marker, maxsplit=1)[1]
+    return text
+
+
+def remove_thought_channel(text: str) -> str:
+    return re.sub(r"<\|channel>thought\s*.*?<channel\|>", "", text, flags=re.DOTALL)
+
+
+def remove_special_tokens(text: str) -> str:
+    text = re.sub(r"<\|channel>[^<]*<channel\|>", "", text)
+    text = re.sub(r"<[^>\n]+>", "", text)
+    return text
+
+
+def collapse_padding(text: str) -> str:
+    text = text.replace("<pad>", "")
+    text = text.replace("<eos>", "")
+    text = text.replace("<bos>", "")
+    return re.sub(r"\n{3,}", "\n\n", text)
 
 
 if __name__ == "__main__":
